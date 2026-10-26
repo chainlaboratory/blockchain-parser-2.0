@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-from datetime import datetime
+from datetime import datetime, timezone
 from bitcoin.core import CBlockHeader
 
 from .utils import decode_uint32, format_hash
@@ -62,8 +62,8 @@ class BlockHeader(object):
     def timestamp(self):
         """Returns the timestamp of the block as a UTC datetime object"""
         if self._timestamp is None:
-            self._timestamp = datetime.utcfromtimestamp(
-                decode_uint32(self.hex[68:72])
+            self._timestamp = datetime.fromtimestamp(
+                decode_uint32(self.hex[68:72]), timezone.utc
             )
         return self._timestamp
 

@@ -11,7 +11,6 @@
 
 from bitcoin.core.script import *
 from binascii import b2a_hex
-from .utils_taproot import from_taproot
 
 
 def is_public_key(hex_data):
@@ -109,11 +108,15 @@ class Script(object):
         return self.script.is_witness_v0_keyhash()
 
     def is_p2tr(self):
-        if len(self.operations) > 1 and type(self.operations[1]) == bytes:
-            taproot = from_taproot(b2a_hex(self.operations[1]).decode("ascii"))
-            return self.operations[0] == 1 \
-                and isinstance(taproot, str) \
-                and taproot.startswith("bc1p")
+        """Return whether this is a BIP341 taproot output (OP_1 <32 bytes>)."""
+        operations = self.operations
+        return (
+            len(self.hex) == 34
+            and len(operations) == 2
+            and operations[0] == 1
+            and isinstance(operations[1], (bytes, bytearray))
+            and len(operations[1]) == 32
+        )
 
     def is_pubkey(self):
         return len(self.operations) == 2 \
@@ -121,29 +124,37 @@ class Script(object):
             and is_public_key(self.operations[0])
 
     def is_pubkeyhash(self):
-        return len(self.hex) == 25 \
-            and self.operations[0] == OP_DUP \
-            and self.operations[1] == OP_HASH160 \
-            and self.operations[-2] == OP_EQUALVERIFY \
-            and self.operations[-1] == OP_CHECKSIG
+        operations = self.operations
+        if len(self.hex) != 25 or len(operations) != 5:
+            return False
+        pushed = operations[2]
+        return (
+            operations[0] == OP_DUP
+            and operations[1] == OP_HASH160
+            and isinstance(pushed, (bytes, bytearray))
+            and len(pushed) == 20
+            and operations[-2] == OP_EQUALVERIFY
+            and operations[-1] == OP_CHECKSIG
+        )
 
     def is_multisig(self):
-        if len(self.operations) < 4:
+        operations = self.operations
+        if len(operations) < 4:
             return False
-        m = self.operations[0]
-
-        if not isinstance(m, int):
+        m = operations[0]
+        n = operations[-2]
+        if not isinstance(m, int) or not isinstance(n, int):
             return False
-
-        for i in range(m):
-            if not is_public_key(self.operations[1+i]):
+        if m < 0 or n < 1 or m > n or n > 16:
+            return False
+        if operations[-1] != OP_CHECKMULTISIG:
+            return False
+        # OP_m, exactly n pubkeys, OP_n, OP_CHECKMULTISIG
+        if len(operations) != n + 3:
+            return False
+        for operation in operations[1:-2]:
+            if not is_public_key(operation):
                 return False
-
-        n = self.operations[-2]
-        if not isinstance(n, int) or n < m \
-                or self.operations[-1] != OP_CHECKMULTISIG:
-            return False
-
         return True
 
     def is_unknown(self):

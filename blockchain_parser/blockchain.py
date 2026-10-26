@@ -14,7 +14,6 @@ import mmap
 import struct
 import pickle
 import stat
-import plyvel
 
 from blockchain_parser.transaction import Transaction
 from blockchain_parser.index import DBTransactionIndex
@@ -91,6 +90,145 @@ def get_block(blockfile, offset):
         return f.read(size)
 
 
+def _chain_work(bits):
+    """Return the proof-of-work contributed by a compact nBits target."""
+    if not bits:
+        return 0
+    exponent = bits >> 24
+    mantissa = bits & 0xffffff
+    if mantissa == 0:
+        return 0
+    if exponent <= 3:
+        target = mantissa >> (8 * (3 - exponent))
+    else:
+        target = mantissa << (8 * (exponent - 3))
+    if target <= 0:
+        return 0
+    return (1 << 256) // (target + 1)
+
+
+def select_main_chain(block_indexes):
+    """Return the most-work chain, oldest block first.
+
+    LevelDB stores block index entries under their hash, so iteration order
+    is not block height. Forks are resolved by total chain work, the same
+    rule Bitcoin Core uses to choose the active chain.
+    """
+    if not block_indexes:
+        return []
+
+    by_hash = {}
+    for block in block_indexes:
+        by_hash[block.hash] = block
+
+    has_successor = {block.prev_hash for block in block_indexes}
+    tips = [block for block in block_indexes if block.hash not in has_successor]
+    if not tips:
+        tips = list(block_indexes)
+
+    memo = {}
+
+    def work_of(start_block):
+        stack = [start_block]
+        stacked = {start_block.hash}
+        while stack:
+            current = stack[-1]
+            if current.hash in memo:
+                stack.pop()
+                stacked.discard(current.hash)
+                continue
+            prev = by_hash.get(current.prev_hash)
+            if prev is not None and prev.hash not in memo:
+                if prev.hash in stacked:
+                    prev = None
+                else:
+                    stack.append(prev)
+                    stacked.add(prev.hash)
+                    continue
+            prev_work = memo[prev.hash] if prev is not None else 0
+            memo[current.hash] = prev_work + _chain_work(
+                getattr(current, "bits", None)
+            )
+            stack.pop()
+            stacked.discard(current.hash)
+        return memo[start_block.hash]
+
+    for tip in tips:
+        work_of(tip)
+
+    best = max(
+        tips,
+        key=lambda block: (memo[block.hash], block.height, block.hash),
+    )
+
+    ordered = []
+    seen = set()
+    current = best
+    while current is not None and current.hash not in seen:
+        seen.add(current.hash)
+        ordered.append(current)
+        current = by_hash.get(current.prev_hash)
+    ordered.reverse()
+    return ordered
+
+
+def iter_chain_indexes(ordered, start=0, end=None):
+    """Select main-chain index entries for a height window.
+
+    When ``end`` is greater than ``start``, heights ``start`` inclusive
+    through ``end`` exclusive are returned. When ``start`` is greater than
+    ``end``, heights from ``start`` down to ``end`` are returned and both
+    ends are included. Entries without block data are omitted.
+    """
+    if not ordered:
+        return []
+
+    by_height = {}
+    for block in ordered:
+        by_height[block.height] = block
+
+    if end is None:
+        end = max(by_height) + 1
+
+    if end < start:
+        heights = range(start, end - 1, -1)
+    else:
+        heights = range(start, end)
+
+    selected = []
+    for height in heights:
+        block = by_height.get(height)
+        if block is None:
+            continue
+        if getattr(block, "file", -1) == -1 or getattr(block, "data_pos", -1) == -1:
+            continue
+        selected.append(block)
+    return selected
+
+
+def _load_block_indexes(index_path, cache):
+    """Load block index entries from a pickle cache or from LevelDB."""
+    block_indexes = None
+    if cache and os.path.exists(cache):
+        with open(cache, 'rb') as f:
+            block_indexes = pickle.load(f)
+        if not block_indexes or not hasattr(block_indexes[0], "bits"):
+            block_indexes = None
+
+    if block_indexes is None:
+        import plyvel
+        with plyvel.DB(index_path, compression=None) as db:
+            # Block index entries are stored with keys prefixed by 'b'
+            with db.iterator(prefix=b'b') as iterator:
+                block_indexes = [
+                    DBBlockIndex(format_hash(k[1:]), v) for k, v in iterator
+                ]
+        if cache:
+            with open(cache, 'wb') as f:
+                pickle.dump(block_indexes, f)
+    return block_indexes
+
+
 class Blockchain(object):
     """Represent the blockchain contained in the series of .blk files
     maintained by bitcoind.
@@ -107,119 +245,24 @@ class Blockchain(object):
             for raw_block in get_blocks(blk_file):
                 yield Block(raw_block, None, os.path.split(blk_file)[1])
 
-    def _index_confirmed(self, chain_indexes, num_confirmations=6):
-        """Check if the first block index in "chain_indexes" has at least
-        "num_confirmation" (6) blocks built on top of it.
-        If it doesn't it is not confirmed and is an orphan.
-        """
-
-        # chains holds a 2D list of sequential block hash chains
-        # as soon as there an element of length num_confirmations,
-        # we can make a decision about whether or not the block in question
-        # is confirmed by checking if it's hash is in that list
-        chains = []
-        # this is the block in question
-        first_block = None
-
-        # loop through all future blocks
-        for i, index in enumerate(chain_indexes):
-            # if this block doesn't have data don't confirm it
-            if index.file == -1 or index.data_pos == -1:
-                return False
-
-            # parse the block
-            blkFile = os.path.join(self.path, "blk%05d.dat" % index.file)
-            block = Block(get_block(blkFile, index.data_pos))
-
-            if i == 0:
-                first_block = block
-
-            chains.append([block.hash])
-
-            for chain in chains:
-                # if this block can be appended to an existing block in one
-                # of the chains, do it
-                if chain[-1] == block.header.previous_block_hash:
-                    chain.append(block.hash)
-
-                # if we've found a chain length == num_dependencies (usually 6)
-                # we are ready to make a decision on whether or not the block
-                # belongs to a fork or the main chain
-                if len(chain) == num_confirmations:
-                    return first_block.hash in chain
-
     def get_ordered_blocks(self, index, start=0, end=None, cache=None):
-        """Yields the blocks contained in the .blk files as per
-        the heigt extract from the leveldb index present at path
-        index maintained by bitcoind.
+        """Yield main-chain blocks in height order.
+
+        ``index`` is the path of Bitcoin Core's LevelDB block index. ``start``
+        and ``end`` are block heights. When ``end`` is greater than ``start``,
+        heights ``start`` inclusive through ``end`` exclusive are yielded.
+        When ``start`` is greater than ``end``, blocks are yielded from
+        ``start`` down to ``end`` and both heights are included.
+
+        ``cache`` stores the parsed index with pickle. Delete that file to
+        pick up blocks written after the cache was created. Header-only and
+        pruned entries are skipped.
         """
-
-        blockIndexes = None
-
-        if cache and os.path.exists(cache):
-            # load the block index cache from a previous index
-            with open(cache, 'rb') as f:
-                blockIndexes = pickle.load(f)
-
-        if blockIndexes is None:
-            with plyvel.DB(index, compression=None) as db:
-                # Block index entries are stored with keys prefixed by 'b'
-                with db.iterator(prefix=b'b') as iterator:
-                    blockIndexes = [DBBlockIndex(format_hash(k[1:]), v) for k, v in iterator]
-
-            if cache and not os.path.exists(cache):
-                # cache the block index for re-use next time
-                with open(cache, 'wb') as f:
-                    pickle.dump(blockIndexes, f)
-
-        # Occasionally a node will receive two different solutions to a block
-        # at the same time. The node saves both to disk, not pruning the
-        # block that leads to a shorter chain once the fork is settled without
-        # "-reindex"ing the bitcoind block data. This leads to sometimes there
-        # being two blocks with the same height in the database.
-        # We throw out blocks that don't have at least 6 other blocks on top of
-        # it (6 confirmations).
-        stale_blocks = []  # hold hashes of blocks that are stale with < 6 blocks on top
-        last_height = -1
-        for i, blockIdx in enumerate(blockIndexes):
-            if last_height > -1:
-                # if this block is the same height as the last block an orphan
-                # occurred, now we have to figure out which of the two to keep
-                if blockIdx.height == last_height:
-
-                    # loop through future blocks until we find a chain 6 blocks
-                    # long that includes this block. If we can't find one
-                    # remove this block as it is invalid
-                    if self._index_confirmed(blockIndexes[i:]):
-
-                        # if this block is confirmed, the unconfirmed block is
-                        # the previous one. Remove it.
-                        stale_blocks.append(blockIndexes[i - 1].hash)
-                    else:
-
-                        # if this block isn't confirmed, remove it.
-                        stale_blocks.append(blockIndexes[i].hash)
-
-            last_height = blockIdx.height
-
-        # filter out stale blocks, so we are left only with block indexes
-        # that have been confirmed
-        # (or are new enough that they haven't yet been confirmed)
-        blockIndexes = list(filter(lambda block: block.hash not in stale_blocks, blockIndexes))
-
-        if end is None:
-            end = len(blockIndexes)
-
-        if end < start:
-            blockIndexes = list(reversed(blockIndexes))
-            start = len(blockIndexes) - start
-            end = len(blockIndexes) - end
-
-        for blkIdx in blockIndexes[start:end]:
-            if blkIdx.file == -1 or blkIdx.data_pos == -1:
-                break
-            blkFile = os.path.join(self.path, "blk%05d.dat" % blkIdx.file)
-            yield Block(get_block(blkFile, blkIdx.data_pos), blkIdx.height)
+        block_indexes = _load_block_indexes(index, cache)
+        ordered = select_main_chain(block_indexes)
+        for blk_idx in iter_chain_indexes(ordered, start, end):
+            blk_file = os.path.join(self.path, "blk%05d.dat" % blk_idx.file)
+            yield Block(get_block(blk_file, blk_idx.data_pos), blk_idx.height)
 
     def get_transaction(self, txid, db):
         """Yields the transaction contained in the .blk files as a python
@@ -234,6 +277,8 @@ class Blockchain(object):
 
         tx_hash_fmtd = unhexlify(tx_hash)
         raw_hex = db.get(tx_hash_fmtd)
+        if raw_hex is None:
+            return None
 
         tx_idx = DBTransactionIndex(utils.format_hash(tx_hash_fmtd), raw_hex)
         blk_file = os.path.join(self.path, "blk%05d.dat" % tx_idx.blockfile_no)

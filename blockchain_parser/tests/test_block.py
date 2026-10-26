@@ -10,10 +10,10 @@
 # in the LICENSE file.
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .utils import read_test_data
-from blockchain_parser.block import Block
+from blockchain_parser.block import Block, get_block_transactions
 
 
 class TestBlock(unittest.TestCase):
@@ -32,7 +32,7 @@ class TestBlock(unittest.TestCase):
         self.assertEqual(1, block.header.version)
         self.assertEqual(1, block.header.difficulty)
         self.assertEqual(285, block.size)
-        self.assertEqual(datetime.utcfromtimestamp(1231006505),
+        self.assertEqual(datetime.fromtimestamp(1231006505, timezone.utc),
                          block.header.timestamp)
         self.assertEqual("0" * 64, block.header.previous_block_hash)
 
@@ -48,3 +48,8 @@ class TestBlock(unittest.TestCase):
             self.assertTrue("ffff001d" in tx.inputs[0].script.value)
             self.assertEqual("0" * 64, tx.inputs[0].transaction_hash)
             self.assertEqual(50 * 100000000, tx.outputs[0].value)
+
+    def test_truncated_transaction_raises(self):
+        raw_block = b"\x00" * 80 + b"\x01" + b"\xff" * 8
+        with self.assertRaises(ValueError):
+            list(get_block_transactions(raw_block))

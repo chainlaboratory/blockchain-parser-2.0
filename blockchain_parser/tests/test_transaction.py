@@ -44,6 +44,24 @@ class TestTransaction(unittest.TestCase):
         tx = Transaction(compliant)
         self.assertTrue(tx.uses_bip69())
 
+    def test_bip69_sorts_scripts_as_bytes(self):
+        def build(scripts):
+            tx_input = b"\x11" * 32 + b"\x00\x00\x00\x00" + b"\x00" + b"\xff" * 4
+            outputs = b""
+            for script in scripts:
+                outputs += (b"\x01" + b"\x00" * 7) + bytes([len(script)]) + script
+            raw = (
+                b"\x01\x00\x00\x00"
+                + b"\x01" + tx_input
+                + bytes([len(scripts)]) + outputs
+                + b"\x00\x00\x00\x00"
+            )
+            return Transaction(raw)
+
+        # 0x6a < 0x76, so OP_RETURN before OP_DUP is the BIP69 byte order.
+        self.assertTrue(build([b"\x6a", b"\x76"]).uses_bip69())
+        self.assertFalse(build([b"\x76", b"\x6a"]).uses_bip69())
+
     def test_bech32_p2wpkh(self):
         tx = Transaction(read_test_data("bech32_p2wpkh.txt"))
         self.assertEqual(["3BBqfnaPbgi5KWECWdFpvryUfw7QatWy37"], [a.address for a in tx.outputs[0].addresses])

@@ -181,14 +181,16 @@ class Transaction(object):
         if self.n_inputs == 1 and self.n_outputs == 1:
             return True
 
+        # BIP69 compares previous outpoints in display byte order, then index.
         input_keys = [
-            (i.transaction_hash, i.transaction_index)
+            (i.hex[:32][::-1], i.transaction_index)
             for i in self.inputs
         ]
 
         if bip69_sort(input_keys) != input_keys:
             return False
 
-        output_keys = [(o.value, o.script.value) for o in self.outputs]
+        # Output scripts are compared as raw scriptPubKey bytes.
+        output_keys = [(o.value, o.script.hex) for o in self.outputs]
 
         return bip69_sort(output_keys) == output_keys

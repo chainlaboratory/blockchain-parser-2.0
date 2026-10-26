@@ -26,17 +26,22 @@ def get_block_transactions(raw_hex):
     n_transactions, offset = decode_compactsize(transaction_data)
 
     for i in range(n_transactions):
-        # Try from 1024 (1KiB) -> 1073741824 (1GiB) slice widths
+        transaction = None
+        # Try from 1024 (1KiB) -> 512MiB slice widths
         for j in range(0, 20):
             try:
                 offset_e = offset + (1024 * 2 ** j)
                 transaction = Transaction.from_hex(
                     transaction_data[offset:offset_e])
-                yield transaction
                 break
-            except:
-                continue
+            except Exception:
+                transaction = None
+        if transaction is None:
+            raise ValueError(
+                "failed to parse transaction %d at offset %d" % (i, offset)
+            )
 
+        yield transaction
         # Skipping to the next transaction
         offset += transaction.size
 
